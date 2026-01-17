@@ -660,6 +660,67 @@ else
 end
 end
 
+% Estimates track curvature and heading angle at a given arc-length position using
+% three-point circle fit.
+% Inputs:
+%   s - arc-length position
+%   s_dist - cumulative distances
+%   waypts - n×2 waypoint matrix
+%   ds - distance offset for finite difference
+% Outputs:
+%   kappa - estimated curvature (1/radius)
+%   Phi - heading angle at position s
+function [kappa, Phi] = track_at_s(s, s_dist, waypts, ds)
+p1 = interp_track(s - ds, s_dist, waypts);
+p2 = interp_track(s,       s_dist, waypts);
+p3 = interp_track(s + ds,  s_dist, waypts);
+
+a = norm(p2 - p1);
+b = norm(p3 - p2);
+c = norm(p3 - p1);
+
+v1 = p2 - p1;
+v2 = p3 - p1;
+area = 0.5 * abs(v1(1)*v2(2) - v1(2)*v2(1));
+
+denom = a*b*c;
+if denom < 1e-9
+    kappa = 0.0;
+else
+    kappa = 4.0 * area / denom;
+end
+
+% Transform to unit vectors for heading calculation
+v1_unit = v1 / a;
+v2_unit = v2 / b;
+% Formula: atan(dy/dx)
+Phi = atan2(v2_unit(2) - v1_unit(2), v2_unit(1) - v1_unit(1));
+end
+
+% Computes linear approximations of the contouring and lag errors
+% as given in the paper
+% Inputs:
+%   s_progress - current arc-length position
+%   state - [x; y; psi; vx; vy; r] vehicle state
+%   s_dist - cumulative distances
+%   waypts - n×2 waypoint matrix
+%   ds - distance offset for finite difference
+% Outputs:
+%   e_c - contouring error
+%   e_l - lag error
+function [e_c, e_l] = error_measures(s_progress, state, s_dist, waypts, ds)
+X = state(1);
+Y = state(2);
+
+[~, Phi] = track_at_s(s_progress, s_dist, waypts, ds);
+p_ref = interp_track(s_progress, s_dist, waypts);
+X_ref = p_ref(1);
+Y_ref = p_ref(2);
+
+e_c = sin(Phi)*(X-X_ref) - cos(Phi)*(Y-Y_ref);
+e_l = -cos(Phi)*(X-X_ref) - sin(Phi)*(Y-Y_ref);
+end
+
 % Computes maximum safe velocity from track curvature and lateral acceleration limit
 % Inputs:
 %   kappa - track curvature (1/radius)
@@ -700,35 +761,40 @@ function [delta, ax_cmd ] = time_optimal_controller( ...
 x = state(1); y = state(2); psi = state(3);
 vx = state(4);
 
-% steering
-s_target = s_progress + look_ahead;
-track_length = s_dist(end);
-while s_target > track_length, s_target = s_target - track_length; end
-while s_target < 0,          s_target = s_target + track_length; end
 
-p_target = interp_track(s_target, s_dist, waypts);
-dir_vec = p_target - [x; y];
-desired_psi = atan2(dir_vec(2), dir_vec(1));
-heading_err = angle_wrap(desired_psi - psi);
 
-delta = k_delta * heading_err;
-delta = min(max(delta, -max_steer), max_steer);
+if ~exist('ax_cmd', 'var') || ~exist('delta', 'var')
+    % steering
+    s_target = s_progress + look_ahead;
+    track_length = s_dist(end);
+    while s_target > track_length, s_target = s_target - track_length; end
+    while s_target < 0,          s_target = s_target + track_length; end
 
-% speed planning
-s_vals = linspace(s_progress, s_progress + max(look_ahead*2.0, 1.0), nsamples);
-vmax_vals = zeros(size(s_vals));
-ds = max(1.0, look_ahead/10.0);
+    p_target = interp_track(s_target, s_dist, waypts);
+    dir_vec = p_target - [x; y];
+    desired_psi = atan2(dir_vec(2), dir_vec(1));
+    heading_err = angle_wrap(desired_psi - psi);
 
-for i=1:numel(s_vals)
-    kappa = curvature_at_s(s_vals(i), s_dist, waypts, ds);
-    vmax_vals(i) = vmax_from_lateral_acc(kappa, a_lat_max);
+    delta = k_delta * heading_err;
+    delta = min(max(delta, -max_steer), max_steer);
+
+    % speed planning
+    s_vals = linspace(s_progress, s_progress + max(look_ahead*2.0, 1.0), nsamples);
+    vmax_vals = zeros(size(s_vals));
+    ds = max(1.0, look_ahead/10.0);
+
+    for i=1:numel(s_vals)
+        kappa = curvature_at_s(s_vals(i), s_dist, waypts, ds);
+        vmax_vals(i) = vmax_from_lateral_acc(kappa, a_lat_max);
+    end
+
+    planned_vmax = min(vmax_vals);
+    vx_target = min(vx_ref, planned_vmax);
+
+    k_vx_local = 2.0;
+    ax_cmd = k_vx_local * (vx_target - vx);
 end
 
-planned_vmax = min(vmax_vals);
-vx_target = min(vx_ref, planned_vmax);
-
-k_vx_local = 2.0;
-ax_cmd = k_vx_local * (vx_target - vx);
 ax_cmd = min(max(ax_cmd, max_brake), max_accel);
 end
 
